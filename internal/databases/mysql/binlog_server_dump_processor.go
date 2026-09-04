@@ -122,6 +122,17 @@ type BinlogDumpProcessor struct {
 	parser  binlogEventParser
 	sink    eventSink
 
+	heartbeatPeriod   time.Duration
+	heartbeatDisabled bool
+
+	// currentFile is the basename of the source file being streamed.
+	// logPos is the source reader position: the first byte after all consumed
+	// source events. replicaLogPos is the source position last communicated to
+	// the replica, either by forwarding an event or by sending a heartbeat.
+	currentFile   string
+	logPos        uint64
+	replicaLogPos uint64
+
 	// requiredGTIDs is the replica's already-executed set from
 	// COM_BINLOG_DUMP_GTID; transactions it contains are skipped. This
 	// command is MySQL-only; MariaDB replicas negotiate GTID state via
@@ -134,19 +145,19 @@ type BinlogDumpProcessor struct {
 func newBinlogDumpRequestProcessor(ctx context.Context, params binlogSourceParams, serverID int, sink eventSink) *BinlogDumpProcessor {
 	sent, _ := mysql.ParseGTIDSet(mysql.MySQLFlavor, "")
 	return &BinlogDumpProcessor{
-		ctx:       ctx,
-		untilTS:   params.untilTS,
-		serverID:  serverID,
-		fetcher:   &s3BinlogFetcher{params: params},
-		parser:    newFileEventParser(),
-		sink:      sink,
-		sentGTIDs: sent,
+		ctx:               ctx,
+		untilTS:           params.untilTS,
+		serverID:          serverID,
+		fetcher:           &s3BinlogFetcher{params: params},
+		parser:            newFileEventParser(),
+		sink:              sink,
+		sentGTIDs:         sent,
+		heartbeatDisabled: params.heartbeatDisabled,
 	}
 }
 
 // https://github.com/percona/percona-server/blob/8.0/libbinlogevents/include/control_events.h#L53-L108
-func (p *BinlogDumpProcessor) addRotateEvent(pos mysql.Position) error {
-	// create rotate event
+func buildRotateEvent(pos mysql.Position, serverID int) *replication.BinlogEvent {
 	rotateBinlogEvent := replication.BinlogEvent{}
 
 	messageBodySize := 8 + len(pos.Name) + 1
@@ -160,7 +171,7 @@ func (p *BinlogDumpProcessor) addRotateEvent(pos mysql.Position) error {
 	rotateBinlogEvent.RawData[binlogEventPos] = byte(replication.ROTATE_EVENT)
 	binlogEventPos++
 	// server_id - 4 bytes
-	binary.LittleEndian.PutUint32(rotateBinlogEvent.RawData[binlogEventPos:], uint32(p.serverID))
+	binary.LittleEndian.PutUint32(rotateBinlogEvent.RawData[binlogEventPos:], uint32(serverID))
 	binlogEventPos += 4
 	// event_length - 4 bytes
 	binary.LittleEndian.PutUint32(rotateBinlogEvent.RawData[binlogEventPos:], uint32(eventLength))
@@ -185,7 +196,88 @@ func (p *BinlogDumpProcessor) addRotateEvent(pos mysql.Position) error {
 	checksum := crc32.ChecksumIEEE(rotateBinlogEvent.RawData[0 : replication.EventHeaderSize+messageBodySize])
 	binary.LittleEndian.PutUint32(rotateBinlogEvent.RawData[binlogEventPos:], checksum)
 
-	return p.sink.addEvent(&rotateBinlogEvent)
+	return &rotateBinlogEvent
+}
+
+// Heartbeat V2 TLV payload field identifiers, from Percona's
+// libbinlogevents/include/codecs/binary.h (OTW_HB_* constants).
+const (
+	heartbeatLogFilenameField uint64 = 1 // OTW_HB_LOG_FILENAME_FIELD
+	heartbeatLogPositionField uint64 = 2 // OTW_HB_LOG_POSITION_FIELD
+	heartbeatHeaderEndMark    uint64 = 0 // OTW_HB_HEADER_END_MARK
+)
+
+// buildHeartbeatV2Event builds a raw HEARTBEAT_LOG_EVENT_V2 (event type 41)
+func buildHeartbeatV2Event(filename string, position uint64, serverID int) *replication.BinlogEvent {
+	// The position is stored as a length-encoded integer, so the position
+	// field length is the byte length of that encoding.
+	positionValue := mysql.PutLengthEncodedInt(position)
+	body := make([]byte, 0, len(filename)+len(positionValue)+8)
+	body = append(body, mysql.PutLengthEncodedInt(heartbeatLogFilenameField)...)
+	body = append(body, mysql.PutLengthEncodedInt(uint64(len(filename)))...)
+	body = append(body, filename...)
+	body = append(body, mysql.PutLengthEncodedInt(heartbeatLogPositionField)...)
+	body = append(body, mysql.PutLengthEncodedInt(uint64(len(positionValue)))...)
+	body = append(body, positionValue...)
+	body = append(body, mysql.PutLengthEncodedInt(heartbeatHeaderEndMark)...)
+
+	eventLength := replication.EventHeaderSize + len(body) + replication.BinlogChecksumLength
+	rawData := make([]byte, eventLength)
+
+	// common header: timestamp 0, event type 41, server id, event length,
+	// low 32 bits of the position in log_pos, flags 0
+	rawData[binlogFileHeaderSize] = byte(replication.HEARTBEAT_LOG_EVENT_V2)
+	binary.LittleEndian.PutUint32(rawData[5:], uint32(serverID))
+	binary.LittleEndian.PutUint32(rawData[9:], uint32(eventLength))
+	binary.LittleEndian.PutUint32(rawData[13:], uint32(position))
+	copy(rawData[replication.EventHeaderSize:], body)
+
+	checksum := crc32.ChecksumIEEE(rawData[0 : eventLength-replication.BinlogChecksumLength])
+	binary.LittleEndian.PutUint32(rawData[eventLength-replication.BinlogChecksumLength:], checksum)
+
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.HEARTBEAT_LOG_EVENT_V2,
+			ServerID:  uint32(serverID),
+			EventSize: uint32(eventLength),
+			LogPos:    uint32(position),
+		},
+		RawData: rawData,
+	}
+}
+
+// sendHeartbeatAt emits a heartbeat V2 whose position is the source byte from
+// which replication should continue. In other words, all source bytes before
+// nextEventLogPos have been consumed. It is a no-op when heartbeat output is
+// disabled or no source file has been streamed yet.
+func (p *BinlogDumpProcessor) sendHeartbeatAt(logPos uint64) error {
+	if p.heartbeatDisabled || p.currentFile == "" {
+		return nil
+	}
+	heartbeatEvent := buildHeartbeatV2Event(p.currentFile, logPos, p.serverID)
+	tracelog.DebugLogger.Printf("Sending heartbeat V2: file=%s position=%d", p.currentFile, logPos)
+	if err := p.sink.addEvent(heartbeatEvent); err != nil {
+		return err
+	}
+	p.replicaLogPos = logPos
+	return nil
+}
+
+// sendEvent forwards a source event to the replica. If source events were
+// suppressed since the previously forwarded event, it first sends a heartbeat
+// that advances the replica to the beginning of this event.
+func (p *BinlogDumpProcessor) sendEvent(event *replication.BinlogEvent, eventBeginLogPos uint64) error {
+	if p.replicaLogPos < eventBeginLogPos {
+		if err := p.sendHeartbeatAt(eventBeginLogPos); err != nil {
+			return err
+		}
+	}
+
+	if err := p.sink.addEvent(event); err != nil {
+		return err
+	}
+	p.replicaLogPos = p.logPos
+	return nil
 }
 
 func logEventDebug(e *replication.BinlogEvent, msg string) {
@@ -199,6 +291,11 @@ func (p *BinlogDumpProcessor) handleEvent(e *replication.BinlogEvent) error {
 	if p.ctx.Err() != nil {
 		return p.ctx.Err()
 	}
+
+	// Account for every consumed source event, forwarded or suppressed.
+	eventBeginLogPos := p.logPos
+	p.logPos += uint64(len(e.RawData))
+
 	if int64(e.Header.Timestamp) > p.untilTS.Unix() {
 		logEventDebug(e, "Stopping stream (reason=after_untilTS)")
 		return errUntilTSReached
@@ -229,7 +326,8 @@ func (p *BinlogDumpProcessor) handleEvent(e *replication.BinlogEvent) error {
 			return nil
 		}
 	}
-	return p.sink.addEvent(e)
+
+	return p.sendEvent(e, eventBeginLogPos)
 }
 
 // decideSkipForGTID updates skip state from a GTID_EVENT; returns true if
@@ -259,16 +357,41 @@ func (p *BinlogDumpProcessor) decideSkipForGTID(e *replication.BinlogEvent) bool
 // and processes each in order.
 func (p *BinlogDumpProcessor) processBinlogFiles(ctx context.Context, fileCh <-chan string) error {
 	for {
+		file, ok, err := p.waitForNextFile(ctx, fileCh)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := p.ProcessBinlogFile(file); err != nil {
+			return err
+		}
+	}
+}
+
+// waitForNextFile receives the next fetched binlog file identifier. While
+// the fetch of the next file stalls (e.g. a storage download), an idle
+// heartbeat is sent whenever the wait outlasts the requested heartbeat
+// period;
+func (p *BinlogDumpProcessor) waitForNextFile(ctx context.Context, fileCh <-chan string) (string, bool, error) {
+	var tickerC <-chan time.Time
+	if p.heartbeatPeriod > 0 {
+		ticker := time.NewTicker(p.heartbeatPeriod)
+		tickerC = ticker.C
+		defer ticker.Stop()
+	}
+
+	for {
 		select {
 		case file, ok := <-fileCh:
-			if !ok {
-				return nil
-			}
-			if err := p.ProcessBinlogFile(file); err != nil {
-				return err
+			return file, ok, nil
+		case <-tickerC:
+			if err := p.sendHeartbeatAt(p.logPos); err != nil {
+				return "", false, err
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", false, ctx.Err()
 		}
 	}
 }
@@ -287,9 +410,17 @@ func (p *BinlogDumpProcessor) ProcessBinlogFile(file string) error {
 	tracelog.InfoLogger.Printf("Streaming %s to replica", file)
 
 	basename := path.Base(file)
-	if err := p.addRotateEvent(mysql.Position{Name: basename, Pos: binlogFileHeaderSize}); err != nil {
+	// An artificial rotate does not consume source bytes. Position it at the
+	// previous file's log position so sendEvent can resynchronize a skipped
+	// tail before the rotate switches the replica to the next file.
+	rotateEvent := buildRotateEvent(mysql.Position{Name: basename, Pos: binlogFileHeaderSize}, p.serverID)
+	if err := p.sendEvent(rotateEvent, p.logPos); err != nil {
 		return err
 	}
+	// Start from the beginning of the new binlog file.
+	p.currentFile = basename
+	p.logPos = binlogFileHeaderSize
+	p.replicaLogPos = binlogFileHeaderSize
 
 	return p.parser.parse(file, binlogFileHeaderSize, p.handleEvent)
 }
@@ -320,8 +451,31 @@ func (p *BinlogDumpProcessor) process() error {
 	// Reaching untilTS is a normal, successful stop condition, not a
 	// failure: there is nothing left worth streaming, so any files not
 	// yet processed are simply skipped.
-	if errors.Is(err, errUntilTSReached) {
+	if err != nil && !errors.Is(err, errUntilTSReached) {
+		return err
+	}
+
+	return nil
+}
+
+// runIdleHeartbeats keeps sending idle heartbeats at the requested period once
+// all binlog files have been streamed, while WAL-G waits for the replica to
+// apply them. It exits when the phase context is cancelled.
+func (p *BinlogDumpProcessor) runIdleHeartbeats(ctx context.Context) error {
+	if p.heartbeatDisabled || p.heartbeatPeriod <= 0 {
 		return nil
 	}
-	return err
+
+	ticker := time.NewTicker(p.heartbeatPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := p.sendHeartbeatAt(p.logPos); err != nil {
+				return err
+			}
+		}
+	}
 }
