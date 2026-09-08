@@ -19,6 +19,8 @@ FROM wal-g/mysql8:latest
 
 COPY --from=build /go/src/github.com/wal-g/wal-g/main/mysql/wal-g /usr/bin
 
+# Refresh test helpers even when the MySQL base image is reused.
+COPY docker/mysql/export_common.sh docker/mysql/export_test_funcs.sh /usr/local/
 COPY docker/mysql_tests/scripts/ /tmp
 
 CMD /tmp/run_integration_tests.sh  -p /tmp/mysql8_tests

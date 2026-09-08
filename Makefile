@@ -214,7 +214,7 @@ load_docker_common: load_ubuntu_18_04 load_ubuntu_22_04
 
 mysql_integration_test: deps mysql_build unlink_brotli load_docker_common
 	./link_brotli.sh
-	docker compose build mysql && docker compose build $(MYSQL_TEST)
+	docker compose build mysql8 && docker compose build $(MYSQL_TEST)
 	docker compose up --force-recreate --exit-code-from $(MYSQL_TEST) $(MYSQL_TEST)
 
 mysql8_integration_test: go_deps unlink_brotli load_docker_common

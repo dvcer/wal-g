@@ -15,20 +15,23 @@ export WALG_MYSQL_BINLOG_SERVER_REPLICA_SOURCE="sbtest@tcp(127.0.0.1:3306)/sbtes
 mysqld --initialize --init-file=/etc/mysql/init.sql
 service mysql start
 
-# binlog.000002
+# These rows will be included in the backup.
 mysql -e "CREATE TABLE sbtest.pitr(id VARCHAR(32), ts DATETIME)"
 mysql -e "INSERT INTO sbtest.pitr VALUES('from_binlog_01', NOW())"
 mysql -e "INSERT INTO sbtest.pitr VALUES('from_binlog_02', NOW())"
 mysql -e "FLUSH BINARY LOGS"
+BACKUP_BINLOG=$(mysql -N -e "SHOW BINARY LOGS" | awk 'END {print $1}')
 wal-g backup-push
 
-# binlog.000003
+# Taking a backup may rotate the binlog; capture the actual post-backup file.
+INCLUDED_BINLOG=$(mysql -N -e "SHOW BINARY LOGS" | awk 'END {print $1}')
 mysql -e "INSERT INTO sbtest.pitr VALUES('from_binlog_03', NOW())"
 mysql -e "INSERT INTO sbtest.pitr VALUES('from_binlog_04', NOW())"
 mysql -e "FLUSH BINARY LOGS"
 wal-g binlog-push
 
-# binlog.000004
+# This file will be archived after the last-modified cutoff.
+EXCLUDED_BINLOG=$(mysql -N -e "SHOW BINARY LOGS" | awk 'END {print $1}')
 mysql -e "INSERT INTO sbtest.pitr VALUES('lmt_ignored_01', NOW())"
 sleep 1
 DT1=$(date3339)
@@ -46,10 +49,9 @@ mysql_set_gtid_purged
 BINLOG_SERVER_LOG=/tmp/binlog_server_until_lmt.log
 
 # DT1 is used as both PITR time (--until) and the binlog last-modified cutoff
-# (--until-binlog-last-modified-time).  binlog.000002 and 000003 were pushed
-# to S3 before DT1, so they are eligible.  binlog.000004 was pushed after
-# DT1, so it must be filtered out by endBinlogTS even though lmt_ignored_01
-# (inside it) is valid data before PITR time.
+# (--until-binlog-last-modified-time). BACKUP_BINLOG and INCLUDED_BINLOG were
+# pushed before DT1. EXCLUDED_BINLOG was pushed after DT1, so it must be
+# filtered out even though lmt_ignored_01 is valid data before PITR time.
 WALG_LOG_LEVEL="DEVEL" wal-g binlog-server \
     --since LATEST \
     --until "$DT1" \
@@ -67,13 +69,13 @@ wait "$walg_pid"
 
 mysqldump sbtest > /tmp/dump_after_pitr_until_lmt
 
-# rows from binlog.000002 and 000003 (pushed before LMT cutoff, before PITR time)
+# Rows from the backup and binlogs archived before the last-modified cutoff.
 grep -w 'from_binlog_01' /tmp/dump_after_pitr_until_lmt
 grep -w 'from_binlog_02' /tmp/dump_after_pitr_until_lmt
 grep -w 'from_binlog_03' /tmp/dump_after_pitr_until_lmt
 grep -w 'from_binlog_04' /tmp/dump_after_pitr_until_lmt
 
-# lmt_ignored_01 is in binlog.000004 which was pushed to S3 after DT1 (LMT),
+# lmt_ignored_01 is in EXCLUDED_BINLOG, which was pushed to S3 after DT1 (LMT),
 # so it must be absent even though the data is before PITR time
 if grep -w 'lmt_ignored_01' /tmp/dump_after_pitr_until_lmt; then
     echo "ERROR: found row from a binlog beyond the last-modified cutoff"
@@ -86,12 +88,12 @@ if grep -w 'after_pitr_01' /tmp/dump_after_pitr_until_lmt; then
     exit 1
 fi
 
-# binlog-server must stream binlog.000002 and 000003 (pushed before LMT cutoff)
-grep -F 'Streaming /tmp/mysql-bin.000002 to replica' "$BINLOG_SERVER_LOG"
-grep -F 'Streaming /tmp/mysql-bin.000003 to replica' "$BINLOG_SERVER_LOG"
+# The source files archived before the last-modified cutoff must be streamed.
+grep -F "Streaming $WALG_MYSQL_BINLOG_DST/$BACKUP_BINLOG to replica" "$BINLOG_SERVER_LOG"
+grep -F "Streaming $WALG_MYSQL_BINLOG_DST/$INCLUDED_BINLOG to replica" "$BINLOG_SERVER_LOG"
 
-# binlog-server must not stream binlog.000004 (pushed after LMT cutoff)
-if grep -F 'Streaming /tmp/mysql-bin.000004 to replica' "$BINLOG_SERVER_LOG"; then
-    echo "ERROR: streamed mysql-bin.000004 beyond the last-modified cutoff"
+# The source file archived after the last-modified cutoff must not be streamed.
+if grep -F "Streaming $WALG_MYSQL_BINLOG_DST/$EXCLUDED_BINLOG to replica" "$BINLOG_SERVER_LOG"; then
+    echo "ERROR: streamed $EXCLUDED_BINLOG beyond the last-modified cutoff"
     exit 1
 fi

@@ -4,7 +4,6 @@ set -e -x
 . /usr/local/export_common.sh
 
 export WALE_S3_PREFIX=s3://mysqlbinlogpushfetchbucket
-export WALG_MYSQL_BINLOG_DST=/tmp/binlogs
 export WALG_MYSQL_CHECK_GTIDS=True
 
 mysqld --initialize --init-file=/etc/mysql/init.sql
@@ -30,24 +29,21 @@ wal-g binlog-push
 current_binlog=$(mysql -e "SHOW BINARY LOGS" | tail -n 1 | awk '{print $1}')
 mysql -N -e 'show binary logs' | awk '{print $1}' | grep -v "$current_binlog" > /tmp/proper_order
 
-rm -rf /tmp/binlogs
-mkdir /tmp/binlogs
-
 # workaround for fetch, as default --until value doesn't include microseconds,
 # so it may be less than binlog ctime's
 sleep 2
 
 wal-g binlog-fetch --since LATEST
-diff -u /tmp/proper_order /tmp/binlogs/binlogs_order
+diff -u /tmp/proper_order "$WALG_MYSQL_BINLOG_DST/binlogs_order"
 while read -r binlog; do
-    test -f /tmp/binlogs/"$binlog"
-    ls -lah "$MYSQLDATA"/"$binlog" /tmp/binlogs/"$binlog"
-    if ! cmp "$MYSQLDATA"/"$binlog" /tmp/binlogs/"$binlog"; then
+    test -f "$WALG_MYSQL_BINLOG_DST/$binlog"
+    ls -lah "$MYSQLDATA"/"$binlog" "$WALG_MYSQL_BINLOG_DST/$binlog"
+    if ! cmp "$MYSQLDATA"/"$binlog" "$WALG_MYSQL_BINLOG_DST/$binlog"; then
         mysqlbinlog -v "$MYSQLDATA"/"$binlog" > /tmp/proper.sql
-        mysqlbinlog -v /tmp/binlogs/"$binlog" > /tmp/fetched.sql
+        mysqlbinlog -v "$WALG_MYSQL_BINLOG_DST/$binlog" > /tmp/fetched.sql
         diff -u /tmp/proper.sql /tmp/fetched.sql
     fi
-done < /tmp/binlogs/binlogs_order
+done < "$WALG_MYSQL_BINLOG_DST/binlogs_order"
 
 
 echo "Get GTIDs, and write HUGE GTID to cache, so no binlogs should be uploaded anymore"

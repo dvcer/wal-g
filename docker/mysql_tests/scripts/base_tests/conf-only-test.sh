@@ -7,6 +7,10 @@ set -e -x
 ## ensure correct conf option will overwrite this trash
 #export AWS_ENDPOINT=we23i902309239
 
+binlog_dst=$(mktemp -d "/tmp/walg-binlogs-$(basename "$0" .sh).XXXXXX")
+# Use the YAML setting instead of the test runner's inherited directory.
+unset WALG_MYSQL_BINLOG_DST
+
 cat > /root/conf.yaml <<EOH
 WALE_S3_PREFIX: s3://mysqlconfonly
 AWS_ENDPOINT: http://s3:9000
@@ -17,7 +21,7 @@ WALG_S3_MAX_PART_SIZE: 5242880
 WALG_STREAM_RESTORE_COMMAND: "xbstream -x -C ${MYSQLDATA}"
 WALG_MYSQL_BACKUP_PREPARE_COMMAND: "xtrabackup --prepare --target-dir=${MYSQLDATA}"
 WALG_MYSQL_BINLOG_REPLAY_COMMAND: 'mysqlbinlog --stop-datetime="$WALG_MYSQL_BINLOG_END_TS" "$WALG_MYSQL_CURRENT_BINLOG" | mysql'
-WALG_MYSQL_BINLOG_DST: /tmp
+WALG_MYSQL_BINLOG_DST: "$binlog_dst"
 WALG_MYSQL_DATASOURCE_NAME: sbtest:@/sbtest
 WALG_STREAM_CREATE_COMMAND: "xtrabackup --backup \
     --stream=xbstream \

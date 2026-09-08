@@ -18,9 +18,11 @@ COPY CMakeLists-brotli.txt CMakeLists-brotli.txt
 
 RUN USE_BROTLI=1 make ENABLE_RACE_DETECTION=1 deps mysql_build
 
-FROM wal-g/mysql:latest
+FROM wal-g/mysql8:latest
 COPY --from=build /go/src/github.com/wal-g/wal-g/main/mysql/wal-g /usr/bin
 
+# Refresh test helpers even when the MySQL base image is reused.
+COPY docker/mysql/export_common.sh docker/mysql/export_test_funcs.sh /usr/local/
 COPY docker/mysql_tests/scripts/ /tmp
 
 ARG TEST_ARG=""
