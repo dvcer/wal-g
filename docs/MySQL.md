@@ -191,6 +191,34 @@ all executed transactions at the moment this particular binlog file created.
 This feature may be useful when you are uploading binlogs from different hosts (e.g. after master switchower)
 Note: Don't use `WALG_MYSQL_CHECK_GTIDS` when GTIDs are not used - it will slow down binlog upload.
 
+`WALG_MYSQL_BINLOG_BATCH_SIZE` sets the maximum number of files per upload batch
+(default: `10`; must be a positive integer). With `WALG_MYSQL_CHECK_GTIDS` enabled,
+WAL-G writes an intent to `binlog_sentinel_005.json` before uploading a batch. After upload, it commits the
+GTID checkpoint and root-level `LastCommittedBinlog` boundary and removes the
+intent in the same sentinel write. The local filename cache advances only after this commit.
+
+On restart, WAL-G recovers an outstanding intent using the binlog objects listed
+in storage, then continues with local files. A file purged after preparation is
+skipped; later files in the batch can still be uploaded and committed.
+With `WALG_MYSQL_CHECK_GTIDS` disabled, WAL-G uses the same batch upload loop:
+it does not fetch, create, or update the sentinel or recover pending intents, and updates
+the local cache once at the end of each batch that uploaded files. An existing sentinel, including its
+`GtidArchived` value, remains untouched. No gap detection is performed by this protocol.
+
+Sentinel fetching retains the existing best-effort behavior: fetch errors do
+not stop the command at that step. Recovery listing and GTID-processing errors remain
+fatal. An empty intent is cleared without changing the committed checkpoint or
+local cache.
+Legacy empty MySQL checkpoints are initialized from the successor header of the
+first file actually uploaded; later updates include only uploaded files.
+
+Run only one uploader for an archive, including across master promotion.
+Uploads retain the existing overwrite behavior. Recovery performs one listing
+of `binlog_005/` per interrupted batch (which may include the entire retained
+binlog history); normal uploading does not check object existence first. Older WAL-G
+writers discard the added `Intent` and `LastCommittedBinlog` fields, so resolve outstanding intents
+before reverting to an older writer.
+
 ### ``binlog-fetch``
 
 Fetches binlogs from storage and saves them to `WALG_MYSQL_BINLOG_DST` folder.

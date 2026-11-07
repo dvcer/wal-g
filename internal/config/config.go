@@ -157,12 +157,15 @@ const (
 	OplogReplayMaxMongodRestarts        = "OPLOG_REPLAY_MAX_MONGOD_RESTARTS"
 	OplogRecoverTimeout                 = "OPLOG_RECOVER_TIMEOUT"
 
-	MysqlDatasourceNameSetting        = "WALG_MYSQL_DATASOURCE_NAME"
-	MysqlSslCaSetting                 = "WALG_MYSQL_SSL_CA"
-	MysqlBinlogReplayCmd              = "WALG_MYSQL_BINLOG_REPLAY_COMMAND"
-	MysqlBinlogDstSetting             = "WALG_MYSQL_BINLOG_DST"
-	MysqlBackupPrepareCmd             = "WALG_MYSQL_BACKUP_PREPARE_COMMAND"
-	MysqlCheckGTIDs                   = "WALG_MYSQL_CHECK_GTIDS"
+	MysqlDatasourceNameSetting = "WALG_MYSQL_DATASOURCE_NAME"
+	MysqlSslCaSetting          = "WALG_MYSQL_SSL_CA"
+	MysqlBinlogReplayCmd       = "WALG_MYSQL_BINLOG_REPLAY_COMMAND"
+	MysqlBinlogDstSetting      = "WALG_MYSQL_BINLOG_DST"
+	MysqlBackupPrepareCmd      = "WALG_MYSQL_BACKUP_PREPARE_COMMAND"
+	MysqlCheckGTIDs            = "WALG_MYSQL_CHECK_GTIDS"
+	// TEMP REVIEW BEGIN: new batch-size setting
+	MysqlBinlogBatchSize = "WALG_MYSQL_BINLOG_BATCH_SIZE"
+	// TEMP REVIEW END: new batch-size setting
 	MysqlBinlogServerHost             = "WALG_MYSQL_BINLOG_SERVER_HOST"
 	MysqlBinlogServerPort             = "WALG_MYSQL_BINLOG_SERVER_PORT"
 	MysqlBinlogServerUser             = "WALG_MYSQL_BINLOG_SERVER_USER"
@@ -609,13 +612,16 @@ var (
 
 	MysqlAllowedSettings = map[string]bool{
 		// MySQL
-		MysqlDatasourceNameSetting:        true,
-		MysqlSslCaSetting:                 true,
-		MysqlBinlogReplayCmd:              true,
-		MysqlBinlogDstSetting:             true,
-		MysqlBackupPrepareCmd:             true,
-		MysqlTakeBinlogsFromMaster:        true,
-		MysqlCheckGTIDs:                   true,
+		MysqlDatasourceNameSetting: true,
+		MysqlSslCaSetting:          true,
+		MysqlBinlogReplayCmd:       true,
+		MysqlBinlogDstSetting:      true,
+		MysqlBackupPrepareCmd:      true,
+		MysqlTakeBinlogsFromMaster: true,
+		MysqlCheckGTIDs:            true,
+		// TEMP REVIEW BEGIN: register the new batch-size setting
+		MysqlBinlogBatchSize: true,
+		// TEMP REVIEW END: register the new batch-size setting
 		StreamSplitterPartitions:          true,
 		StreamSplitterBlockSize:           true,
 		StreamSplitterMaxFileSize:         true,

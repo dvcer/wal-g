@@ -29,6 +29,10 @@ const BinlogReadHeaderSize = 128 * 1024
 
 type BinlogSentinelDto struct {
 	GTIDArchived string `json:"GtidArchived"`
+	// TEMP REVIEW BEGIN: new optional sentinel fields
+	LastCommittedBinlog string              `json:"LastCommittedBinlog,omitempty"`
+	Intent              *BinlogUploadIntent `json:"Intent,omitempty"`
+	// TEMP REVIEW END: new optional sentinel fields
 }
 
 func (dto *BinlogSentinelDto) String() string {
