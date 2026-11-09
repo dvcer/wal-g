@@ -155,6 +155,14 @@ Removing a sentinel also does not protect a restore that has already read it.
   a `mongod` restart cannot continue from the cached file list. See
   `internal/databases/mongo/binary/backup_cursor.go` and `backup.go`.
 
+## MySQL binlog upload metadata
+
+- A batch intent relies on the checkpoint stored alongside it. When no sentinel
+  is loaded, `binlog_push_handler.go` seeds the checkpoint from the first prepared
+  file's preceding history before publishing the intent. Commit and recovery use
+  only the persisted baseline and uploaded file contributions; an existing empty
+  checkpoint is valid and must not trigger initialization from local headers.
+
 ## Validation and handoff
 
 - MongoDB binary and Redis AOF/TS backups share `WALG_BACKUP_FILE_PART_SIZE` and

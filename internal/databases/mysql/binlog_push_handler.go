@@ -77,18 +77,23 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 	// TEMP REVIEW BEGIN: changed: detect flavor before recovery in both modes
 	flavor, err := getMySQLFlavor(conn)
 	tracelog.ErrorLogger.FatalOnError(err)
+	metadataHandler := newBinlogMetadataHandler(flavor)
 
 	// TEMP REVIEW END: changed: detect flavor before recovery in both modes
 
 	// TEMP REVIEW BEGIN: GTID-checked sentinel fetch, logging, and startup recovery
 	var binlogSentinelDto BinlogSentinelDto
+	initializeCheckpoint := false
 	if checkGTIDs {
 		err = FetchBinlogSentinel(ctx, rootFolder, &binlogSentinelDto)
+		// Preserve best-effort fetching. Bootstrap only when no sentinel was loaded;
+		// an existing sentinel can legitimately contain an empty GTID checkpoint.
+		initializeCheckpoint = err != nil && binlogSentinelDto.Intent == nil
 		if err == nil && binlogSentinelDto.GTIDArchived != "" {
 			tracelog.InfoLogger.Printf("fetched binlog archived GTID SET: %s\n", binlogSentinelDto.GTIDArchived)
 		}
 
-		binlogSentinelDto, err = recoverIfNeeded(ctx, rootFolder, binlogSentinelDto, flavor)
+		binlogSentinelDto, err = recoverIfNeeded(ctx, rootFolder, binlogSentinelDto, metadataHandler)
 		tracelog.ErrorLogger.FatalOnError(err)
 	}
 
@@ -152,12 +157,25 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 			cursor++
 			name := binlogsForUpload[i]
 			next := binlogsForUpload[i+1]
-			file, err := prepareBinlogEntry(binlogsFolder, name, next, flavor, checkGTIDs)
+			file, err := prepareBinlogEntry(binlogsFolder, name, next, metadataHandler, checkGTIDs)
 			if errors.Is(err, os.ErrNotExist) {
 				tracelog.WarningLogger.Printf("Binlog %s or its successor was purged during preparation; skipping", name)
 				continue
 			}
 			tracelog.ErrorLogger.FatalOnError(err)
+			// Bootstrap missing metadata from the history before the first prepared file.
+			// Persist it with the intent so recovery only needs the recorded contributions.
+			if initializeCheckpoint {
+				gtids, err := readBinlogPreviousGTIDs(binlogsFolder, name, flavor)
+				if errors.Is(err, os.ErrNotExist) {
+					tracelog.WarningLogger.Printf("Binlog file %s not found; probably purged, skipping initialization", name)
+					continue
+				}
+				tracelog.ErrorLogger.FatalOnError(err)
+				binlogSentinelDto.GTIDArchived = gtids.String()
+				initializeCheckpoint = false
+				tracelog.InfoLogger.Printf("Initializing binlog archived GTID SET before %s: %s", name, gtids.String())
+			}
 			file.ObjectName = utility.AddFileExtension(name, uploader.Compression().FileExtension())
 			intent.Files = append(intent.Files, file)
 		}
@@ -187,7 +205,7 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 		}
 
 		// Commit metadata for uploaded files and update the local cache
-		binlogSentinelDto, err = commitBinlogBatch(ctx, rootFolder, binlogSentinelDto, uploadedFiles, flavor, checkGTIDs)
+		binlogSentinelDto, err = commitBinlogBatch(ctx, rootFolder, binlogSentinelDto, uploadedFiles, metadataHandler, checkGTIDs)
 		tracelog.ErrorLogger.FatalOnError(err)
 	}
 	// TEMP REVIEW END: changed upload loop: prepare batch, upload files, commit metadata
@@ -229,17 +247,14 @@ func filterBinlogs(binlogs []string, lastArchivedBinlog, untilBinlog string, fil
 	return binlogs[start : end+1]
 }
 
-func prepareBinlogEntry(dir, name, next, flavor string, checkGTIDs bool) (BinlogUploadFile, error) {
-	file := BinlogUploadFile{Name: name}
+func prepareBinlogEntry(dir, name, next string, metadataHandler binlogMetadataHandler, checkGTIDs bool) (BinlogUploadFile, error) {
 	if !checkGTIDs {
-		return file, nil
+		return BinlogUploadFile{Name: name}, nil
 	}
-	gtids, before, err := binlogFileGTIDs(dir, name, next, flavor)
+	file, err := metadataHandler.collectIntentInfoForBinlogFile(dir, name, next)
 	if err != nil {
 		return file, fmt.Errorf("read GTIDs for %s: %w", name, err)
 	}
-	file.GTIDs = gtids.String()
-	file.GTIDExecutedBeforeBinlog = before.String()
 	return file, nil
 }
 

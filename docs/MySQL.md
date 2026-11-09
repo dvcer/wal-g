@@ -209,8 +209,10 @@ Sentinel fetching retains the existing best-effort behavior: fetch errors do
 not stop the command at that step. Recovery listing and GTID-processing errors remain
 fatal. An empty intent is cleared without changing the committed checkpoint or
 local cache.
-Legacy empty MySQL checkpoints are initialized from the successor header of the
-first file actually uploaded; later updates include only uploaded files.
+When no sentinel is loaded, WAL-G initializes the checkpoint from the history
+preceding the first prepared file and persists it with the first intent, before
+uploading any files. Commits then apply only uploaded files. A successfully loaded
+sentinel with an empty checkpoint is used as-is.
 
 Run only one uploader for an archive, including across master promotion.
 Uploads retain the existing overwrite behavior. Recovery performs one listing
