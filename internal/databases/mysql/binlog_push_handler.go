@@ -13,8 +13,10 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pkg/errors"
+	"github.com/spf13/viper"
 	"github.com/wal-g/tracelog"
 	"github.com/wal-g/wal-g/internal"
+	conf "github.com/wal-g/wal-g/internal/config"
 	"github.com/wal-g/wal-g/utility"
 )
 
@@ -185,6 +187,15 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 
 	// Write Binlog Cache (even when no data uploaded, it will create file on first run)
 	putCache(cache)
+}
+
+func getBinlogBatchSize() (int, error) {
+	batchSize := viper.GetInt(conf.MysqlBinlogBatchSize)
+	if batchSize <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q",
+			conf.MysqlBinlogBatchSize, viper.GetString(conf.MysqlBinlogBatchSize))
+	}
+	return batchSize, nil
 }
 
 func getMySQLBinlogs(conn *client.Conn) ([]string, error) {

@@ -163,6 +163,7 @@ const (
 	MysqlBinlogDstSetting             = "WALG_MYSQL_BINLOG_DST"
 	MysqlBackupPrepareCmd             = "WALG_MYSQL_BACKUP_PREPARE_COMMAND"
 	MysqlCheckGTIDs                   = "WALG_MYSQL_CHECK_GTIDS"
+	MysqlBinlogBatchSize              = "WALG_MYSQL_BINLOG_BATCH_SIZE"
 	MysqlBinlogServerHost             = "WALG_MYSQL_BINLOG_SERVER_HOST"
 	MysqlBinlogServerPort             = "WALG_MYSQL_BINLOG_SERVER_PORT"
 	MysqlBinlogServerUser             = "WALG_MYSQL_BINLOG_SERVER_USER"
@@ -334,6 +335,7 @@ var (
 		StreamSplitterBlockSize:     "1048576",
 		MysqlBackupDownloadMaxRetry: "1",
 		MysqlIncrementalBackupDst:   "/tmp",
+		MysqlBinlogBatchSize:        "5",
 	}
 
 	SQLServerDefaultSettings = map[string]string{
@@ -616,6 +618,7 @@ var (
 		MysqlBackupPrepareCmd:             true,
 		MysqlTakeBinlogsFromMaster:        true,
 		MysqlCheckGTIDs:                   true,
+		MysqlBinlogBatchSize:              true,
 		StreamSplitterPartitions:          true,
 		StreamSplitterBlockSize:           true,
 		StreamSplitterMaxFileSize:         true,
