@@ -54,11 +54,6 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 	binlogs, err := getMySQLBinlogs(conn)
 	tracelog.ErrorLogger.FatalOnError(err)
 
-	lastBinlog := lastOrDefault(binlogs, "")
-	if untilBinlog == "" || BinlogNum(untilBinlog) > BinlogNum(lastBinlog) {
-		untilBinlog = lastBinlog
-	}
-
 	var binlogSentinelDto BinlogSentinelDto
 	err = FetchBinlogSentinel(ctx, rootFolder, &binlogSentinelDto)
 	if err == nil && binlogSentinelDto.GTIDArchived != "" {
@@ -131,42 +126,14 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 		}
 	}
 
-	hadUploadsInThisRun := false
-	for i := 0; i < len(binlogs); i++ {
-		binlog := binlogs[i]
+	binlogsForUpload := filterBinlogsForUpload(binlogs, &cache, untilBinlog, filter)
+	for i := 0; i < len(binlogsForUpload)-1; i++ {
+		binlog := binlogsForUpload[i]
 
-		tracelog.DebugLogger.Printf("Testing... %v\n", binlog)
-
-		if untilBinlog != "" && BinlogNum(binlog) >= BinlogNum(untilBinlog) {
-			tracelog.DebugLogger.Printf("Skip binlog %v (until check)\n", binlog)
-			continue
-		}
-
-		if cache.LastArchivedBinlog != "" && BinlogNum(binlog) <= BinlogNum(cache.LastArchivedBinlog) {
-			tracelog.DebugLogger.Printf("Skip binlog %v (archived binlog check)\n", binlog)
-			continue
-		}
-
-		if checkGTIDs && filter.isValid() {
-			nextBinlog := ""
-			if i < len(binlogs)-1 {
-				nextBinlog = binlogs[i+1]
-			}
-			shouldUpload := filter.shouldUpload(binlog, nextBinlog)
-			if !hadUploadsInThisRun && !shouldUpload {
-				tracelog.DebugLogger.Printf("Skip binlog %v (gtid check)\n", binlog)
-				// in fact this binlog had been uploaded before. Mark it as uploaded:
-				cache.LastArchivedBinlog = binlog
-				continue
-			}
-
-			// During PITR WAL-G will apply binlogs one-by-one from oldest to newest
-			// (based on upload timestamp) without checking GTID sets.
-			// It means that during upload phase it is not possible to fill the gaps
-			// in GTID sets (because it will break during PITR phase).
-			// So, for safety reasons
-			// we will upload all other binlogs after uploading single binlog.
-			hadUploadsInThisRun = true
+		// Filtering already advanced the checkpoint for the first selected file.
+		// Continue updating it for later files, which are all uploaded regardless of GTID coverage.
+		if i > 0 && filter != nil && filter.isValid() {
+			filter.shouldUpload(binlog, binlogsForUpload[i+1])
 		}
 
 		// Upload binlogs:
@@ -187,6 +154,50 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 
 	// Write Binlog Cache (even when no data uploaded, it will create file on first run)
 	putCache(cache)
+}
+
+func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog string, filter binlogGtidFilter) []string {
+	// No files to filter.
+	if len(binlogs) == 0 {
+		return binlogs
+	}
+
+	// Exclude the active binlog from uploads.
+	start, end := 0, len(binlogs)-1
+
+	// Start after the last locally archived binlog.
+	if cache.LastArchivedBinlog != "" {
+		for start < end && BinlogNum(binlogs[start]) <= BinlogNum(cache.LastArchivedBinlog) {
+			tracelog.DebugLogger.Printf("Skip binlog %v (archived binlog check)\n", binlogs[start])
+			start++
+		}
+	}
+
+	// Apply the exclusive upper bound.
+	if untilBinlog != "" {
+		for i := start; i < end; i++ {
+			if BinlogNum(binlogs[i]) >= BinlogNum(untilBinlog) {
+				end = i
+				break
+			}
+		}
+	}
+
+	// Skip the initial files whose GTIDs are already archived.
+	if filter != nil && filter.isValid() {
+		for start < end {
+			if filter.shouldUpload(binlogs[start], binlogs[start+1]) {
+				break
+			}
+			tracelog.DebugLogger.Printf("Skip binlog %v (gtid check)\n", binlogs[start])
+			cache.LastArchivedBinlog = binlogs[start]
+			start++
+		}
+	}
+
+	// PITR replays in upload order, so once uploading starts, keep all remaining files.
+	// Retain the final file only for reading the preceding file's end-state GTID header.
+	return binlogs[start : end+1]
 }
 
 func getBinlogBatchSize() (int, error) {
