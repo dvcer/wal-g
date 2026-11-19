@@ -185,6 +185,9 @@ Sends (not yet archived) binlogs to storage. Typically run in CRON.
 wal-g binlog-push
 ```
 
+`WALG_MYSQL_BINLOG_BATCH_SIZE` sets the number of binlogs uploaded sequentially per batch (default: `5`).
+It must be a positive integer. The archived GTID sentinel, when enabled, and local cache are updated after each completed batch.
+
 When `WALG_MYSQL_CHECK_GTIDS` is set wal-g will try to be upload only binlogs which GTID sets contains events that
 wasn't seen before. This is done by parsing binlogs and peeking first PREVIOUS_GTIDS_EVENT that holds GTID set of
 all executed transactions at the moment this particular binlog file created.

@@ -12,11 +12,11 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 	"github.com/wal-g/tracelog"
 	"github.com/wal-g/wal-g/internal"
 	conf "github.com/wal-g/wal-g/internal/config"
+	"github.com/wal-g/wal-g/pkg/storages/storage"
 	"github.com/wal-g/wal-g/utility"
 )
 
@@ -26,27 +26,30 @@ type LogsCache struct {
 	LastArchivedBinlog string `json:"LastArchivedBinlog"`
 }
 
-// binlogGtidFilter decides, based on a database's GTID state, whether a binlog
-// needs to be uploaded again and which GTID set has been archived so far.
+// binlogGtidFilter decides, based on gtid_archived, whether a binlog needs to be uploaded.
 // Implementations exist per MySQL flavor (mysqlGtidFilter, mariadbGtidFilter).
 type binlogGtidFilter interface {
 	// isValid returns true if the filter is properly configured for the current flavor.
 	isValid() bool
 	// shouldUpload determines if a binlog should be uploaded based on GTID checkpoint comparison.
 	shouldUpload(binlog, nextBinlog string) bool
-	// getArchivedGTIDString returns the string representation of the archived GTID checkpoint for the current flavor.
-	getArchivedGTIDString() string
 }
 
 //gocyclo:ignore
 //nolint:funlen
 func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinlog string, checkGTIDs bool) {
+	batchSize, err := getBinlogBatchSize()
+	tracelog.ErrorLogger.FatalOnError(err)
+
 	rootFolder := uploader.Folder()
 	uploader.ChangeDirectory(BinlogPath)
 
 	conn, err := getMySQLConnection(ctx)
 	tracelog.ErrorLogger.FatalOnError(err)
 	defer utility.LoggedClose(conn, "")
+
+	flavor, err := getMySQLFlavor(conn)
+	tracelog.ErrorLogger.FatalOnError(err)
 
 	binlogsFolder, err := getMySQLBinlogsFolder(conn)
 	tracelog.ErrorLogger.FatalOnError(err)
@@ -71,9 +74,6 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 
 	var filter binlogGtidFilter
 	if checkGTIDs {
-		flavor, err := getMySQLFlavor(conn)
-		tracelog.ErrorLogger.FatalOnError(err)
-
 		switch flavor {
 		case mysql.MySQLFlavor:
 			var gtidArchived *mysql.MysqlGTIDSet
@@ -90,6 +90,9 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 						"Failed to convert GTID to MysqlGTIDSet type. Uploading all binlogs and rebuilding the archived GTID checkpoint from scratch.")
 					gtidArchived = nil
 				}
+			}
+			if gtidArchived == nil {
+				binlogSentinelDto.GTIDArchived = ""
 			}
 			filter = &mysqlGtidFilter{
 				binlogsFolder: binlogsFolder,
@@ -115,6 +118,9 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 					}
 				}
 			}
+			if mariadbGTID == nil {
+				binlogSentinelDto.GTIDArchived = ""
+			}
 			filter = &mariadbGtidFilter{
 				binlogsFolder: binlogsFolder,
 				flavor:        flavor,
@@ -127,33 +133,89 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 	}
 
 	binlogsForUpload := filterBinlogsForUpload(binlogs, &cache, untilBinlog, filter)
-	for i := 0; i < len(binlogsForUpload)-1; i++ {
-		binlog := binlogsForUpload[i]
+	for start := 0; start < len(binlogsForUpload)-1; {
+		end := start + min(batchSize, len(binlogsForUpload)-1-start)
+		batchBinlogs := binlogsForUpload[start : end+1]
 
-		// Filtering already advanced the checkpoint for the first selected file.
-		// Continue updating it for later files, which are all uploaded regardless of GTID coverage.
-		if i > 0 && filter != nil && filter.isValid() {
-			filter.shouldUpload(binlog, binlogsForUpload[i+1])
-		}
+		processBinlogBatch(ctx, uploader, rootFolder, binlogsFolder,
+			batchBinlogs, flavor, checkGTIDs, &binlogSentinelDto, &cache)
 
-		// Upload binlogs:
-		err = archiveBinLog(ctx, uploader, binlogsFolder, binlog)
-		tracelog.ErrorLogger.FatalOnError(err)
-
-		cache.LastArchivedBinlog = binlog
-		putCache(cache)
-
-		// Write Binlog Sentinel
-		if checkGTIDs && filter.isValid() {
-			binlogSentinelDto.GTIDArchived = filter.getArchivedGTIDString()
-			tracelog.InfoLogger.Printf("Uploading binlog sentinel: %s", binlogSentinelDto)
-			err := UploadBinlogSentinel(ctx, rootFolder, &binlogSentinelDto)
-			tracelog.ErrorLogger.FatalOnError(err)
-		}
+		start = end
 	}
 
-	// Write Binlog Cache (even when no data uploaded, it will create file on first run)
-	putCache(cache)
+}
+
+func processBinlogBatch(ctx context.Context, uploader internal.Uploader, rootFolder storage.Folder,
+	binlogsFolder string, binlogs []string, flavor string, checkGTIDs bool,
+	sentinel *BinlogSentinelDto, cache *LogsCache) {
+	// Open the whole batch and its successor
+	files, err := openBinlogBatch(binlogsFolder, binlogs)
+	tracelog.ErrorLogger.FatalOnError(err)
+	defer closeBinlogBatch(files)
+
+	// Upload every file before calculating and publishing metadata.
+	err = uploadBinlogs(ctx, uploader, files)
+	tracelog.ErrorLogger.FatalOnError(err)
+
+	if checkGTIDs {
+		previousGTIDs, err := extractMetadata(files, flavor)
+		tracelog.ErrorLogger.FatalOnError(err)
+		err = sentinel.ApplyBatchMetadata(previousGTIDs, flavor)
+		tracelog.ErrorLogger.FatalOnError(err)
+		tracelog.InfoLogger.Printf("Uploading binlog sentinel: %s", sentinel)
+		err = UploadBinlogSentinel(ctx, rootFolder, sentinel)
+		tracelog.ErrorLogger.FatalOnError(err)
+	}
+
+	// Advance the cache once the entire batch is committed.
+	cache.LastArchivedBinlog = binlogs[len(binlogs)-2]
+	putCache(*cache)
+}
+
+func openBinlogBatch(dir string, binlogs []string) ([]*os.File, error) {
+	files := make([]*os.File, 0, len(binlogs))
+	for _, binlog := range binlogs {
+		filename := path.Join(dir, binlog)
+		file, err := os.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open binlog %s: %w", filename, err)
+		}
+		files = append(files, file)
+	}
+	return files, nil
+}
+
+func closeBinlogBatch(files []*os.File) {
+	for _, file := range files {
+		if file != nil {
+			utility.LoggedClose(file, "failed to close binlog")
+		}
+	}
+}
+
+func extractMetadata(files []*os.File, flavor string) ([]mysql.GTIDSet, error) {
+	// Include the first file and successor so adjacent headers describe each uploaded file.
+	previousGTIDs := make([]mysql.GTIDSet, 0, len(files))
+	for _, file := range files {
+		gtids, err := readBinlogFilePreviousGTIDs(file, flavor)
+		if err != nil {
+			return nil, err
+		}
+		previousGTIDs = append(previousGTIDs, gtids)
+	}
+	return previousGTIDs, nil
+}
+
+func uploadBinlogs(ctx context.Context, uploader internal.Uploader, files []*os.File) error {
+	// The final successor is used only for metadata.
+	for i := 0; i < len(files)-1; i++ {
+		file := files[i]
+		tracelog.InfoLogger.Printf("Archiving %s", path.Base(file.Name()))
+		if err := uploader.UploadFile(ctx, file); err != nil {
+			return fmt.Errorf("failed to upload binlog %s: %w", file.Name(), err)
+		}
+	}
+	return nil
 }
 
 func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog string, filter binlogGtidFilter) []string {
@@ -246,23 +308,6 @@ func getMySQLBinlogsFolder(conn *client.Conn) (string, error) {
 		return "", err
 	}
 	return path.Dir(logBinBasename), nil
-}
-
-func archiveBinLog(ctx context.Context, uploader internal.Uploader, dataDir string, binlog string) error {
-	tracelog.InfoLogger.Printf("Archiving %v\n", binlog)
-
-	filename := path.Join(dataDir, binlog)
-	walFile, err := os.Open(filename)
-	if err != nil {
-		return errors.Wrapf(err, "upload: could not open '%s'\n", filename)
-	}
-	defer utility.LoggedClose(walFile, "")
-	err = uploader.UploadFile(ctx, walFile)
-	if err != nil {
-		return errors.Wrapf(err, "upload: could not upload '%s'\n", filename)
-	}
-
-	return nil
 }
 
 func getCache() LogsCache {
