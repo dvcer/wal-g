@@ -186,7 +186,13 @@ wal-g binlog-push
 ```
 
 `WALG_MYSQL_BINLOG_BATCH_SIZE` sets the number of binlogs uploaded sequentially per batch (default: `5`).
-It must be a positive integer. The archived GTID sentinel, when enabled, and local cache are updated after each completed batch.
+It must be a positive integer. The binlog sentinel records an upload intent before each batch and clears it after the batch completes.
+The local cache advances after the committed sentinel is uploaded. These writes also happen when GTID checking is disabled;
+in that mode, committing a batch clears `GtidArchived` because GTID metadata was not collected.
+
+If a previous invocation left an intent, the next `binlog-push` deletes that batch's objects before selecting new files.
+Already absent objects are tolerated. Cleanup failures leave the intent for retry, and intent is cleared only after every deletion succeeds.
+Sentinel read errors stop the push. A missing sentinel or a JSON parsing failure uses an empty sentinel and the existing checkpoint initialization behavior; parsing failures are logged.
 
 When `WALG_MYSQL_CHECK_GTIDS` is set wal-g will try to be upload only binlogs which GTID sets contains events that
 wasn't seen before. This is done by parsing binlogs and peeking first PREVIOUS_GTIDS_EVENT that holds GTID set of

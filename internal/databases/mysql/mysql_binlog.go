@@ -29,7 +29,21 @@ const BinlogSentinelPath = "binlog_sentinel_" + utility.VersionStr + ".json"
 const BinlogReadHeaderSize = 128 * 1024
 
 type BinlogSentinelDto struct {
-	GTIDArchived string `json:"GtidArchived"`
+	GTIDArchived string              `json:"GtidArchived"`
+	Intent       *BinlogUploadIntent `json:"Intent,omitempty"`
+}
+
+type BinlogUploadIntent struct {
+	Files []BinlogUploadFile `json:"Files"`
+}
+
+type BinlogUploadFile struct {
+	Name       string `json:"Name"`
+	ObjectName string `json:"ObjectName"`
+}
+
+type BatchMetadata struct {
+	PreviousGTIDs []mysql.GTIDSet
 }
 
 func (dto *BinlogSentinelDto) String() string {
@@ -38,13 +52,13 @@ func (dto *BinlogSentinelDto) String() string {
 }
 
 // ApplyBatchMetadata updates the archived GTID checkpoint from the batch's ordered headers.
-func (sentinel *BinlogSentinelDto) ApplyBatchMetadata(previousGTIDs []mysql.GTIDSet, flavor string) error {
+func (sentinel *BinlogSentinelDto) ApplyBatchMetadata(metadata *BatchMetadata, flavor string) error {
 	archivedGTIDs, err := mysql.ParseGTIDSet(flavor, sentinel.GTIDArchived)
 	if err != nil {
 		return err
 	}
-	for i := 0; i < len(previousGTIDs)-1; i++ {
-		archivedGTIDs, err = updateBinlogGTIDs(archivedGTIDs, previousGTIDs[i], previousGTIDs[i+1], flavor)
+	for i := 0; i < len(metadata.PreviousGTIDs)-1; i++ {
+		archivedGTIDs, err = updateBinlogGTIDs(archivedGTIDs, metadata.PreviousGTIDs[i], metadata.PreviousGTIDs[i+1], flavor)
 		if err != nil {
 			return err
 		}
@@ -53,21 +67,21 @@ func (sentinel *BinlogSentinelDto) ApplyBatchMetadata(previousGTIDs []mysql.GTID
 	return nil
 }
 
-func updateBinlogGTIDs(archived, previous, next mysql.GTIDSet, flavor string) (mysql.GTIDSet, error) {
+func updateBinlogGTIDs(archived, currentBinlogGtid, nextBinlogGtid mysql.GTIDSet, flavor string) (mysql.GTIDSet, error) {
 	if archived == nil || archived.String() == "" {
 		// Preserve the existing first-upload baseline from the successor header.
-		return next.Clone(), nil
+		return nextBinlogGtid.Clone(), nil
 	}
 
 	if flavor == mysql.MySQLFlavor {
-		contribution := next.Clone().(*mysql.MysqlGTIDSet)
-		gtidSetMinus(contribution, previous.(*mysql.MysqlGTIDSet))
+		contribution := nextBinlogGtid.Clone().(*mysql.MysqlGTIDSet)
+		gtidSetMinus(contribution, currentBinlogGtid.(*mysql.MysqlGTIDSet))
 		if err := archived.Update(contribution.String()); err != nil {
 			return nil, err
 		}
-	} else if !archived.Contain(next) {
+	} else if !archived.Contain(nextBinlogGtid) {
 		// Preserve MariaDB's existing containment/Update checkpoint policy.
-		if err := archived.Update(next.String()); err != nil {
+		if err := archived.Update(nextBinlogGtid.String()); err != nil {
 			return nil, err
 		}
 	}

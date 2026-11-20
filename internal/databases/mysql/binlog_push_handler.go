@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path"
 	"path/filepath"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -57,11 +59,11 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 	binlogs, err := getMySQLBinlogs(conn)
 	tracelog.ErrorLogger.FatalOnError(err)
 
-	var binlogSentinelDto BinlogSentinelDto
-	err = FetchBinlogSentinel(ctx, rootFolder, &binlogSentinelDto)
-	if err == nil && binlogSentinelDto.GTIDArchived != "" {
-		tracelog.InfoLogger.Printf("fetched binlog archived GTID SET: %s\n", binlogSentinelDto.GTIDArchived)
-	}
+	binlogSentinelDto, err := readBinlogSentinel(ctx, rootFolder)
+	tracelog.ErrorLogger.FatalOnError(err)
+	err = recoveryIfNeeded(ctx, rootFolder, &binlogSentinelDto)
+	tracelog.ErrorLogger.FatalOnError(err)
+
 	cache := getCache()
 	if len(binlogs) > 0 && cache.LastArchivedBinlog != "" {
 		if BinlogPrefix(binlogs[0]) != BinlogPrefix(cache.LastArchivedBinlog) ||
@@ -82,6 +84,7 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 				tracelog.WarningLogger.Printf(
 					"Failed to parse MySQL GTID set '%s': %v. Uploading all binlogs and rebuilding the archived GTID checkpoint from scratch.",
 					binlogSentinelDto.GTIDArchived, err)
+				binlogSentinelDto.GTIDArchived = ""
 			} else {
 				var ok bool
 				gtidArchived, ok = gtid.(*mysql.MysqlGTIDSet)
@@ -90,9 +93,6 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 						"Failed to convert GTID to MysqlGTIDSet type. Uploading all binlogs and rebuilding the archived GTID checkpoint from scratch.")
 					gtidArchived = nil
 				}
-			}
-			if gtidArchived == nil {
-				binlogSentinelDto.GTIDArchived = ""
 			}
 			filter = &mysqlGtidFilter{
 				binlogsFolder: binlogsFolder,
@@ -108,6 +108,7 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 					tracelog.WarningLogger.Printf(
 						"Failed to parse MariaDB GTID set '%s': %v. Uploading all binlogs and rebuilding the archived GTID checkpoint from scratch.",
 						binlogSentinelDto.GTIDArchived, err)
+					binlogSentinelDto.GTIDArchived = ""
 				} else {
 					var ok bool
 					mariadbGTID, ok = gtid.(*mysql.MariadbGTIDSet)
@@ -117,9 +118,6 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 						mariadbGTID = nil
 					}
 				}
-			}
-			if mariadbGTID == nil {
-				binlogSentinelDto.GTIDArchived = ""
 			}
 			filter = &mariadbGtidFilter{
 				binlogsFolder: binlogsFolder,
@@ -132,44 +130,68 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 		}
 	}
 
-	binlogsForUpload := filterBinlogsForUpload(binlogs, &cache, untilBinlog, filter)
-	for start := 0; start < len(binlogsForUpload)-1; {
-		end := start + min(batchSize, len(binlogsForUpload)-1-start)
-		batchBinlogs := binlogsForUpload[start : end+1]
+	// The returned slice contains binlogs to upload plus one final successor needed only for metadata.
+	filteredBinlogs := filterBinlogsForUpload(binlogs, &cache, untilBinlog, filter)
+	for start := 0; start < len(filteredBinlogs)-1; {
+		effectiveBatchSize := min(batchSize, len(filteredBinlogs)-1-start)
+		end := start + effectiveBatchSize
+
+		batchBinlogs := filteredBinlogs[start:end]
+		successor := filteredBinlogs[end]
 
 		processBinlogBatch(ctx, uploader, rootFolder, binlogsFolder,
-			batchBinlogs, flavor, checkGTIDs, &binlogSentinelDto, &cache)
+			batchBinlogs, successor, flavor, checkGTIDs, &binlogSentinelDto, &cache)
 
 		start = end
 	}
 
 }
 
+// processBinlogBatch uploads and commits the files in binlogs.
+// The separate successor file is read only when calculating GTID metadata.
 func processBinlogBatch(ctx context.Context, uploader internal.Uploader, rootFolder storage.Folder,
-	binlogsFolder string, binlogs []string, flavor string, checkGTIDs bool,
+	binlogsFolder string, binlogs []string, batchSuccessorBinlog string, flavor string, checkGTIDs bool,
 	sentinel *BinlogSentinelDto, cache *LogsCache) {
-	// Open the whole batch and its successor
+
+	// Open the files
 	files, err := openBinlogBatch(binlogsFolder, binlogs)
 	tracelog.ErrorLogger.FatalOnError(err)
 	defer closeBinlogBatch(files)
 
-	// Upload every file before calculating and publishing metadata.
+	// Add the batch files to intent.
+	sentinel.Intent = createUploadIntent(binlogs, uploader.Compression().FileExtension())
+	tracelog.InfoLogger.Printf("Uploading binlog intent: %s", sentinel)
+	err = UploadBinlogSentinel(ctx, rootFolder, sentinel)
+	tracelog.ErrorLogger.FatalOnError(err)
+
+	// Upload the batch binlogs.
 	err = uploadBinlogs(ctx, uploader, files)
 	tracelog.ErrorLogger.FatalOnError(err)
 
-	if checkGTIDs {
-		previousGTIDs, err := extractMetadata(files, flavor)
-		tracelog.ErrorLogger.FatalOnError(err)
-		err = sentinel.ApplyBatchMetadata(previousGTIDs, flavor)
-		tracelog.ErrorLogger.FatalOnError(err)
-		tracelog.InfoLogger.Printf("Uploading binlog sentinel: %s", sentinel)
-		err = UploadBinlogSentinel(ctx, rootFolder, sentinel)
-		tracelog.ErrorLogger.FatalOnError(err)
-	}
+	// Try to update sentinel metadata, continue uploding on failure
+	err = tryUpdateSentinelMetadata(sentinel, files, path.Join(binlogsFolder, batchSuccessorBinlog), flavor, checkGTIDs)
+	tracelog.WarningLogger.PrintOnError(err)
 
-	// Advance the cache once the entire batch is committed.
-	cache.LastArchivedBinlog = binlogs[len(binlogs)-2]
+	// Commit the batch by publishing updated metadata and clearing intent.
+	sentinel.Intent = nil
+	tracelog.InfoLogger.Printf("Uploading binlog sentinel: %s", sentinel)
+	err = UploadBinlogSentinel(ctx, rootFolder, sentinel)
+	tracelog.ErrorLogger.FatalOnError(err)
+
+	// Save the last uploaded filename in the cache.
+	cache.LastArchivedBinlog = binlogs[len(binlogs)-1]
 	putCache(*cache)
+}
+
+func createUploadIntent(binlogs []string, compressionExtension string) *BinlogUploadIntent {
+	intent := &BinlogUploadIntent{Files: make([]BinlogUploadFile, 0, len(binlogs))}
+	for _, binlog := range binlogs {
+		intent.Files = append(intent.Files, BinlogUploadFile{
+			Name:       binlog,
+			ObjectName: path.Join(BinlogPath, utility.AddFileExtension(binlog, compressionExtension)),
+		})
+	}
+	return intent
 }
 
 func openBinlogBatch(dir string, binlogs []string) ([]*os.File, error) {
@@ -193,23 +215,44 @@ func closeBinlogBatch(files []*os.File) {
 	}
 }
 
-func extractMetadata(files []*os.File, flavor string) ([]mysql.GTIDSet, error) {
-	// Include the first file and successor so adjacent headers describe each uploaded file.
-	previousGTIDs := make([]mysql.GTIDSet, 0, len(files))
+func tryUpdateSentinelMetadata(sentinel *BinlogSentinelDto, files []*os.File, successor string, flavor string, checkGTIDs bool) error {
+	if !checkGTIDs {
+		sentinel.GTIDArchived = ""
+		return nil
+	}
+
+	metadata, err := extractBatchMetadata(files, successor, flavor)
+	if err != nil {
+		return fmt.Errorf("failed to extract batch metadata: %w", err)
+	}
+
+	if err := sentinel.ApplyBatchMetadata(metadata, flavor); err != nil {
+		return fmt.Errorf("failed to apply batch metadata: %w", err)
+	}
+	return nil
+}
+
+func extractBatchMetadata(files []*os.File, successor string, flavor string) (*BatchMetadata, error) {
+	// Collect prev_gtid of uploaded binlogs
+	metadata := &BatchMetadata{PreviousGTIDs: make([]mysql.GTIDSet, 0, len(files)+1)}
 	for _, file := range files {
 		gtids, err := readBinlogFilePreviousGTIDs(file, flavor)
 		if err != nil {
 			return nil, err
 		}
-		previousGTIDs = append(previousGTIDs, gtids)
+		metadata.PreviousGTIDs = append(metadata.PreviousGTIDs, gtids)
 	}
-	return previousGTIDs, nil
+	// Append successor's prev_gtid
+	gtids, err := GetBinlogPreviousGTIDs(successor, flavor)
+	if err != nil {
+		return nil, err
+	}
+	metadata.PreviousGTIDs = append(metadata.PreviousGTIDs, gtids)
+	return metadata, nil
 }
 
 func uploadBinlogs(ctx context.Context, uploader internal.Uploader, files []*os.File) error {
-	// The final successor is used only for metadata.
-	for i := 0; i < len(files)-1; i++ {
-		file := files[i]
+	for _, file := range files {
 		tracelog.InfoLogger.Printf("Archiving %s", path.Base(file.Name()))
 		if err := uploader.UploadFile(ctx, file); err != nil {
 			return fmt.Errorf("failed to upload binlog %s: %w", file.Name(), err)
@@ -218,8 +261,8 @@ func uploadBinlogs(ctx context.Context, uploader internal.Uploader, files []*os.
 	return nil
 }
 
+// filterBinlogsForUpload returns slice contains binlogs to upload plus one final successor needed only for metadata.
 func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog string, filter binlogGtidFilter) []string {
-	// No files to filter.
 	if len(binlogs) == 0 {
 		return binlogs
 	}
@@ -227,7 +270,7 @@ func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog stri
 	// Exclude the active binlog from uploads.
 	start, end := 0, len(binlogs)-1
 
-	// Start after the last locally archived binlog.
+	// If we have local cache - use it to skip all previously uploaded files
 	if cache.LastArchivedBinlog != "" {
 		for start < end && BinlogNum(binlogs[start]) <= BinlogNum(cache.LastArchivedBinlog) {
 			tracelog.DebugLogger.Printf("Skip binlog %v (archived binlog check)\n", binlogs[start])
@@ -260,6 +303,59 @@ func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog stri
 	// PITR replays in upload order, so once uploading starts, keep all remaining files.
 	// Retain the final file only for reading the preceding file's end-state GTID header.
 	return binlogs[start : end+1]
+}
+
+func readBinlogSentinel(ctx context.Context, folder storage.Folder) (BinlogSentinelDto, error) {
+	var sentinel BinlogSentinelDto
+	if err := FetchBinlogSentinel(ctx, folder, &sentinel); err != nil {
+		// Use an empty sentinel if none exists.
+		var notFound storage.ObjectNotFoundError
+		if errors.As(err, &notFound) {
+			return BinlogSentinelDto{}, nil
+		}
+		// Use an empty sentinel if JSON decoding fails.
+		var syntaxError *json.SyntaxError
+		var typeError *json.UnmarshalTypeError
+		if errors.As(err, &syntaxError) || errors.As(err, &typeError) {
+			tracelog.WarningLogger.Printf("Failed to parse binlog sentinel; using an empty sentinel: %v", err)
+			return BinlogSentinelDto{}, nil
+		}
+		return BinlogSentinelDto{}, fmt.Errorf("failed to read binlog sentinel: %w", err)
+	}
+
+	tracelog.InfoLogger.Printf("Fetched binlog sentinel: %s", &sentinel)
+	return sentinel, nil
+}
+
+// recoveryIfNeeded existing intent means last batch was not committed,
+// so we just need to rollback the batch (delete all uploaded binlogs) and start again
+// TODO we can try to finish batch upload instead of rollback if all files from the intent are present on the host
+func recoveryIfNeeded(ctx context.Context, folder storage.Folder, sentinel *BinlogSentinelDto) error {
+	if sentinel.Intent == nil {
+		tracelog.InfoLogger.Println("Binlog upload recovery is not needed")
+		return nil
+	}
+	tracelog.InfoLogger.Println("Uncommitted binlog upload intent found; starting recovery")
+
+	// Delete every intended object; earlier recovery attempts may have removed some already.
+	for _, file := range sentinel.Intent.Files {
+		tracelog.InfoLogger.Printf("Removing uncommitted binlog object %s", file.ObjectName)
+		object := storage.NewLocalObject(file.ObjectName, time.Time{}, 0)
+		if err := folder.DeleteObjects(ctx, []storage.Object{object}); err != nil {
+			var notFound storage.ObjectNotFoundError
+			if !errors.As(err, &notFound) && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("failed to remove uncommitted binlog object %s: %w", file.ObjectName, err)
+			}
+		}
+	}
+
+	// Clear intent only after cleanup succeeds, preserving the committed metadata and cache.
+	sentinel.Intent = nil
+	if err := UploadBinlogSentinel(ctx, folder, sentinel); err != nil {
+		return fmt.Errorf("failed to clear binlog upload intent after recovery: %w", err)
+	}
+	tracelog.InfoLogger.Println("Binlog upload recovery completed")
+	return nil
 }
 
 func getBinlogBatchSize() (int, error) {
