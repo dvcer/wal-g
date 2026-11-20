@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path"
 	"path/filepath"
 	"time"
@@ -37,34 +36,53 @@ type binlogGtidFilter interface {
 	shouldUpload(binlog, nextBinlog string) bool
 }
 
-//gocyclo:ignore
-//nolint:funlen
-func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinlog string, checkGTIDs bool) {
+func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinlog string, checkGTIDs bool, cacheDir string) error {
 	batchSize, err := getBinlogBatchSize()
-	tracelog.ErrorLogger.FatalOnError(err)
-
-	rootFolder := uploader.Folder()
-	uploader.ChangeDirectory(BinlogPath)
+	if err != nil {
+		return err
+	}
 
 	conn, err := getMySQLConnection(ctx)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err != nil {
+		return err
+	}
 	defer utility.LoggedClose(conn, "")
 
 	flavor, err := getMySQLFlavor(conn)
-	tracelog.ErrorLogger.FatalOnError(err)
-
+	if err != nil {
+		return err
+	}
 	binlogsFolder, err := getMySQLBinlogsFolder(conn)
-	tracelog.ErrorLogger.FatalOnError(err)
-
+	if err != nil {
+		return err
+	}
 	binlogs, err := getMySQLBinlogs(conn)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err != nil {
+		return err
+	}
+
+	return pushBinlogs(ctx, uploader, binlogsFolder, binlogs, flavor, untilBinlog, checkGTIDs, cacheDir, batchSize)
+}
+
+// pushBinlogs uploads local binlogs after database discovery has completed.
+//
+//gocyclo:ignore
+//nolint:funlen
+func pushBinlogs(ctx context.Context, uploader internal.Uploader, binlogsFolder string, binlogs []string,
+	flavor string, untilBinlog string, checkGTIDs bool, cacheDir string, batchSize int) error {
+	rootFolder := uploader.Folder()
+	uploader.ChangeDirectory(BinlogPath)
 
 	binlogSentinelDto, err := readBinlogSentinel(ctx, rootFolder)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err != nil {
+		return err
+	}
 	err = recoveryIfNeeded(ctx, rootFolder, &binlogSentinelDto)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err != nil {
+		return err
+	}
 
-	cache := getCache()
+	cache := getCache(cacheDir)
 	if len(binlogs) > 0 && cache.LastArchivedBinlog != "" {
 		if BinlogPrefix(binlogs[0]) != BinlogPrefix(cache.LastArchivedBinlog) ||
 			BinlogNum(binlogs[len(binlogs)-1]) < BinlogNum(cache.LastArchivedBinlog) {
@@ -126,12 +144,12 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 			}
 			tracelog.InfoLogger.Printf("Using MariaDB GTID filter for binlog push")
 		default:
-			tracelog.ErrorLogger.Fatalf("Unsupported flavor type: %s. Disable WALG_MYSQL_CHECK_GTIDS for current database.", flavor)
+			return fmt.Errorf("unsupported flavor type: %s. Disable WALG_MYSQL_CHECK_GTIDS for current database", flavor)
 		}
 	}
 
-	// The returned slice contains binlogs to upload plus one final successor needed only for metadata.
-	filteredBinlogs := filterBinlogsForUpload(binlogs, &cache, untilBinlog, filter)
+	// Non-empty results contain binlogs to upload plus one successor needed only for metadata.
+	filteredBinlogs := filterBinlogsForUpload(binlogs, cache.LastArchivedBinlog, untilBinlog, filter)
 	for start := 0; start < len(filteredBinlogs)-1; {
 		effectiveBatchSize := min(batchSize, len(filteredBinlogs)-1-start)
 		end := start + effectiveBatchSize
@@ -139,34 +157,40 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 		batchBinlogs := filteredBinlogs[start:end]
 		successor := filteredBinlogs[end]
 
-		processBinlogBatch(ctx, uploader, rootFolder, binlogsFolder,
-			batchBinlogs, successor, flavor, checkGTIDs, &binlogSentinelDto, &cache)
+		if err := processBinlogBatch(ctx, uploader, rootFolder, binlogsFolder,
+			batchBinlogs, successor, flavor, checkGTIDs, &binlogSentinelDto, &cache, cacheDir); err != nil {
+			return err
+		}
 
 		start = end
 	}
-
+	return nil
 }
 
 // processBinlogBatch uploads and commits the files in binlogs.
 // The separate successor file is read only when calculating GTID metadata.
 func processBinlogBatch(ctx context.Context, uploader internal.Uploader, rootFolder storage.Folder,
 	binlogsFolder string, binlogs []string, batchSuccessorBinlog string, flavor string, checkGTIDs bool,
-	sentinel *BinlogSentinelDto, cache *LogsCache) {
+	sentinel *BinlogSentinelDto, cache *LogsCache, cacheDir string) error {
 
 	// Open the files
 	files, err := openBinlogBatch(binlogsFolder, binlogs)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err != nil {
+		return err
+	}
 	defer closeBinlogBatch(files)
 
 	// Add the batch files to intent.
 	sentinel.Intent = createUploadIntent(binlogs, uploader.Compression().FileExtension())
 	tracelog.InfoLogger.Printf("Uploading binlog intent: %s", sentinel)
-	err = UploadBinlogSentinel(ctx, rootFolder, sentinel)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err = UploadBinlogSentinel(ctx, rootFolder, sentinel); err != nil {
+		return err
+	}
 
 	// Upload the batch binlogs.
-	err = uploadBinlogs(ctx, uploader, files)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err = uploadBinlogs(ctx, uploader, files); err != nil {
+		return err
+	}
 
 	// Try to update sentinel metadata, continue uploding on failure
 	err = tryUpdateSentinelMetadata(sentinel, files, path.Join(binlogsFolder, batchSuccessorBinlog), flavor, checkGTIDs)
@@ -175,12 +199,14 @@ func processBinlogBatch(ctx context.Context, uploader internal.Uploader, rootFol
 	// Commit the batch by publishing updated metadata and clearing intent.
 	sentinel.Intent = nil
 	tracelog.InfoLogger.Printf("Uploading binlog sentinel: %s", sentinel)
-	err = UploadBinlogSentinel(ctx, rootFolder, sentinel)
-	tracelog.ErrorLogger.FatalOnError(err)
+	if err = UploadBinlogSentinel(ctx, rootFolder, sentinel); err != nil {
+		return err
+	}
 
 	// Save the last uploaded filename in the cache.
 	cache.LastArchivedBinlog = binlogs[len(binlogs)-1]
-	putCache(*cache)
+	putCache(*cache, cacheDir)
+	return nil
 }
 
 func createUploadIntent(binlogs []string, compressionExtension string) *BinlogUploadIntent {
@@ -200,6 +226,7 @@ func openBinlogBatch(dir string, binlogs []string) ([]*os.File, error) {
 		filename := path.Join(dir, binlog)
 		file, err := os.Open(filename)
 		if err != nil {
+			closeBinlogBatch(files)
 			return nil, fmt.Errorf("failed to open binlog %s: %w", filename, err)
 		}
 		files = append(files, file)
@@ -261,8 +288,9 @@ func uploadBinlogs(ctx context.Context, uploader internal.Uploader, files []*os.
 	return nil
 }
 
-// filterBinlogsForUpload returns slice contains binlogs to upload plus one final successor needed only for metadata.
-func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog string, filter binlogGtidFilter) []string {
+// filterBinlogsForUpload returns binlogs to upload plus their successor for metadata.
+// It returns an empty slice when no binlogs need uploading.
+func filterBinlogsForUpload(binlogs []string, lastArchivedBinlog string, untilBinlog string, filter binlogGtidFilter) []string {
 	if len(binlogs) == 0 {
 		return binlogs
 	}
@@ -271,8 +299,8 @@ func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog stri
 	start, end := 0, len(binlogs)-1
 
 	// If we have local cache - use it to skip all previously uploaded files
-	if cache.LastArchivedBinlog != "" {
-		for start < end && BinlogNum(binlogs[start]) <= BinlogNum(cache.LastArchivedBinlog) {
+	if lastArchivedBinlog != "" {
+		for start < end && BinlogNum(binlogs[start]) <= BinlogNum(lastArchivedBinlog) {
 			tracelog.DebugLogger.Printf("Skip binlog %v (archived binlog check)\n", binlogs[start])
 			start++
 		}
@@ -295,9 +323,13 @@ func filterBinlogsForUpload(binlogs []string, cache *LogsCache, untilBinlog stri
 				break
 			}
 			tracelog.DebugLogger.Printf("Skip binlog %v (gtid check)\n", binlogs[start])
-			cache.LastArchivedBinlog = binlogs[start]
 			start++
 		}
+	}
+
+	// return empty slice if nothing to upload
+	if start == end {
+		return []string{}
 	}
 
 	// PITR replays in upload order, so once uploading starts, keep all remaining files.
@@ -406,20 +438,13 @@ func getMySQLBinlogsFolder(conn *client.Conn) (string, error) {
 	return path.Dir(logBinBasename), nil
 }
 
-func getCache() LogsCache {
+func getCache(cacheDir string) LogsCache {
 	var cache LogsCache
-	var cacheFilename string
-
-	usr, err := user.Current()
+	data, err := os.ReadFile(filepath.Join(cacheDir, BinlogCacheFileName))
 	if err == nil {
-		cacheFilename = filepath.Join(usr.HomeDir, BinlogCacheFileName)
-		var file []byte
-		file, err = os.ReadFile(cacheFilename)
+		err = json.Unmarshal(data, &cache)
 		if err == nil {
-			err = json.Unmarshal(file, &cache)
-			if err == nil {
-				return cache
-			}
+			return cache
 		}
 	}
 	if os.IsNotExist(err) {
@@ -430,20 +455,10 @@ func getCache() LogsCache {
 	return LogsCache{}
 }
 
-func putCache(cache LogsCache) {
-	var cacheFilename string
-	usr, err := user.Current()
-	if err != nil {
-		tracelog.ErrorLogger.Printf("Failed to get current user homedir: %v\n", err)
-	}
-	cacheFilename = filepath.Join(usr.HomeDir, BinlogCacheFileName)
-	if err != nil && !os.IsNotExist(err) {
-		tracelog.ErrorLogger.Printf("Failed to read MySQL binlog cache file: %v\n", err)
-	}
-
+func putCache(cache LogsCache, cacheDir string) {
 	marshal, err := json.Marshal(&cache)
-	if err == nil && len(cacheFilename) > 0 {
-		err = os.WriteFile(cacheFilename, marshal, 0644)
+	if err == nil {
+		err = os.WriteFile(filepath.Join(cacheDir, BinlogCacheFileName), marshal, 0644)
 		if err != nil {
 			tracelog.ErrorLogger.Printf("Failed to write MySQL binlog cache file: %v\n", err)
 		}
