@@ -52,12 +52,14 @@ func TestPushBinlogsWithoutSentinel(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Positive scenario: update existing metadata in sentinel
 func TestPushBinlogsPreservesAnotherUUID(t *testing.T) {
 	initialGtidArchived := "00000000-0000-0000-0000-0000000000bb:1-3"
-	folder := setupFolder(t, &BinlogSentinelDto{GTIDArchived: initialGtidArchived})
+	initialSentinel := &BinlogSentinelDto{GTIDArchived: initialGtidArchived}
+	folder := setupFolder(t, initialSentinel)
 	cacheFileName := filepath.Join(t.TempDir(), BinlogCacheFileName)
 
 	clearFolderMocks(folder)
@@ -69,6 +71,7 @@ func TestPushBinlogsPreservesAnotherUUID(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, initialGtidArchived+","+testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from a failed binlog upload.
@@ -87,6 +90,7 @@ func TestPushBinlogsRecoveryFromUploadFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Recover the unfinished batch and upload the remaining binlogs.
 	clearFolderMocks(folder)
@@ -98,6 +102,7 @@ func TestPushBinlogsRecoveryFromUploadFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery with different input binlogs removes abandoned files and preserves committed files.
@@ -116,6 +121,7 @@ func TestPushBinlogsRecoveryFromUploadFailedWithDifferentBinlogs(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Retry with different input files; recovery must remove abandoned binlog 3.
 	clearFolderMocks(folder)
@@ -127,6 +133,7 @@ func TestPushBinlogsRecoveryFromUploadFailedWithDifferentBinlogs(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2:4-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from PUT intent failed.
@@ -145,6 +152,7 @@ func TestPushBinlogsRecoveryFromPUTIntentFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder)
 	assertSentinelGTIDArchived(t, folder, "")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Retry publishing intent and upload all binlogs.
 	clearFolderMocks(folder)
@@ -156,6 +164,7 @@ func TestPushBinlogsRecoveryFromPUTIntentFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from PUT sentinel commit failed.
@@ -174,6 +183,7 @@ func TestPushBinlogsRecoveryFromPUTSentinelCommitFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2)
 	assertSentinelGTIDArchived(t, folder, "")
 	assertBinlogsInSentinelIntent(t, folder, binlog1, binlog2)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Roll back the uncommitted batch and retry the upload.
 	clearFolderMocks(folder)
@@ -185,6 +195,7 @@ func TestPushBinlogsRecoveryFromPUTSentinelCommitFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from GET sentinel failed.
@@ -202,6 +213,7 @@ func TestPushBinlogsRecoveryFromGETSentinelFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Fail reading the sentinel before changing storage.
 	clearFolderMocks(folder)
@@ -214,6 +226,7 @@ func TestPushBinlogsRecoveryFromGETSentinelFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder.MemFolder, binlog1, binlog2)
 	assertSentinelGTIDArchived(t, folder.MemFolder, testDataBinlogServerUuid+":1-2")
 	assertNoSentinelIntent(t, folder.MemFolder)
+	assertSentinelVersion(t, folder.MemFolder, BinlogSentinelVersion)
 
 	// Read the sentinel successfully and upload the remaining binlogs.
 	clearFolderMocks(folder)
@@ -225,6 +238,7 @@ func TestPushBinlogsRecoveryFromGETSentinelFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from DELETE during recovery failed.
@@ -243,6 +257,7 @@ func TestPushBinlogsRecoveryFromDELETEDuringRecoveryFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Recover by deleting binlog 3, then fail deleting binlog 4.
 	clearFolderMocks(folder)
@@ -255,6 +270,7 @@ func TestPushBinlogsRecoveryFromDELETEDuringRecoveryFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Repeat recovery and finish uploading the remaining binlogs.
 	clearFolderMocks(folder)
@@ -266,6 +282,7 @@ func TestPushBinlogsRecoveryFromDELETEDuringRecoveryFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from PUT cleared intent failed during recovery.
@@ -284,6 +301,7 @@ func TestPushBinlogsRecoveryFromPUTDuringRecoveryFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Delete uncommitted files but fail to clear the remote intent.
 	clearFolderMocks(folder)
@@ -296,6 +314,7 @@ func TestPushBinlogsRecoveryFromPUTDuringRecoveryFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Repeat cleanup and upload the remaining binlogs.
 	clearFolderMocks(folder)
@@ -307,11 +326,13 @@ func TestPushBinlogsRecoveryFromPUTDuringRecoveryFailed(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-5")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recovery from a failed binlog upload with GTID checking disabled.
 func TestPushBinlogsRecoveryFromUploadFailedWithGTIDCheckingDisabled(t *testing.T) {
-	folder := setupFolder(t, &BinlogSentinelDto{GTIDArchived: testDataBinlogServerUuid + ":1-5"})
+	initialSentinel := &BinlogSentinelDto{GTIDArchived: testDataBinlogServerUuid + ":1-5"}
+	folder := setupFolder(t, initialSentinel)
 	cacheFileName := filepath.Join(t.TempDir(), BinlogCacheFileName)
 
 	// Fail uploading binlog 4 with GTID checking disabled.
@@ -326,6 +347,7 @@ func TestPushBinlogsRecoveryFromUploadFailedWithGTIDCheckingDisabled(t *testing.
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3)
 	assertSentinelGTIDArchived(t, folder, "")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Recover the batch and continue without GTID metadata.
 	clearFolderMocks(folder)
@@ -338,6 +360,7 @@ func TestPushBinlogsRecoveryFromUploadFailedWithGTIDCheckingDisabled(t *testing.
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, "")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Recover an unfinished upload even when there are no new binlogs to upload.
@@ -356,6 +379,7 @@ func TestPushBinlogsRecoveryFromUploadFailedWithoutNewBinlogs(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertBinlogsInSentinelIntent(t, folder, binlog3, binlog4)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 
 	// Clean up the unfinished batch with no new binlogs to upload.
 	clearFolderMocks(folder)
@@ -367,6 +391,7 @@ func TestPushBinlogsRecoveryFromUploadFailedWithoutNewBinlogs(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2)
 	assertSentinelGTIDArchived(t, folder, testDataBinlogServerUuid+":1-2")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 // Positive scenario: upload all binlogs with GTID checking disabled.
@@ -384,6 +409,7 @@ func TestPushBinlogsWithGTIDCheckingDisabled(t *testing.T) {
 	assertBinlogsInStorage(t, folder, binlog1, binlog2, binlog3, binlog4, binlog5)
 	assertSentinelGTIDArchived(t, folder, "")
 	assertNoSentinelIntent(t, folder)
+	assertSentinelVersion(t, folder, BinlogSentinelVersion)
 }
 
 func setupUploadContext(folder storage.Folder, cacheFileName string) *BinlogUploadContext {
@@ -522,4 +548,9 @@ func assertBinlogsInSentinelIntent(t *testing.T, folder storage.Folder, binlogs 
 func assertNoSentinelIntent(t *testing.T, folder storage.Folder) {
 	t.Helper()
 	require.Nil(t, readSentinel(t, folder).Intent)
+}
+
+func assertSentinelVersion(t *testing.T, folder storage.Folder, expected int) {
+	t.Helper()
+	require.Equal(t, expected, readSentinel(t, folder).Version)
 }

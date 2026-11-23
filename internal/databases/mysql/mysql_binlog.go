@@ -25,10 +25,15 @@ import (
 
 const BinlogSentinelPath = "binlog_sentinel_" + utility.VersionStr + ".json"
 
+const batchUploadVersion = 1
+
+const BinlogSentinelVersion = batchUploadVersion
+
 // 128k should be enough to parse prev_gtids event
 const BinlogReadHeaderSize = 128 * 1024
 
 type BinlogSentinelDto struct {
+	Version      int                 `json:"Version,omitempty"`
 	GTIDArchived string              `json:"GtidArchived"`
 	Intent       *BinlogUploadIntent `json:"Intent,omitempty"`
 }
@@ -101,7 +106,8 @@ func FetchBinlogSentinel(ctx context.Context, folder storage.Folder, sentinelDto
 	return nil
 }
 
-func UploadBinlogSentinel(ctx context.Context, folder storage.Folder, sentinelDto interface{}) error {
+func UploadBinlogSentinel(ctx context.Context, folder storage.Folder, sentinelDto *BinlogSentinelDto) error {
+	sentinelDto.Version = BinlogSentinelVersion
 	sentinelName := BinlogSentinelPath
 	dtoBody, err := json.Marshal(sentinelDto)
 	if err != nil {

@@ -514,7 +514,17 @@ func fetchLogs(ctx context.Context,
 	includeStart := true
 outer:
 	for {
-		logsToFetch, err := getLogsCoveringInterval(ctx, logFolder, startTS, includeStart, endBinlogTS)
+		committedBinlogsUntilTS, err := getCommittedBinlogsUntilTS(ctx, folder)
+		if err != nil {
+			return err
+		}
+
+		iterationEndBinlogTS := endBinlogTS
+		if committedBinlogsUntilTS.Before(iterationEndBinlogTS) {
+			iterationEndBinlogTS = committedBinlogsUntilTS
+		}
+
+		logsToFetch, err := getLogsCoveringInterval(ctx, logFolder, startTS, includeStart, iterationEndBinlogTS)
 		includeStart = false
 		if err != nil {
 			return err
@@ -545,6 +555,31 @@ outer:
 		}
 	}
 	return nil
+}
+
+// getCommittedBinlogsUntilTS returns the sentinel's storage upload time for
+// version 1 and later, since all binlogs uploaded before it are committed.
+// Older versions do not use batch uploads, so they have no such bound and
+// return utility.MaxTime, as do archives without a sentinel.
+func getCommittedBinlogsUntilTS(ctx context.Context, folder storage.Folder) (time.Time, error) {
+	sentinelObject, err := folder.StatObject(ctx, BinlogSentinelPath)
+	if err != nil {
+		var notFound storage.ObjectNotFoundError
+		if errors.As(err, &notFound) {
+			return utility.MaxTime, nil
+		}
+		return time.Time{}, fmt.Errorf("failed to stat binlog sentinel for replay: %w", err)
+	}
+
+	var sentinel BinlogSentinelDto
+	if err := FetchBinlogSentinel(ctx, folder, &sentinel); err != nil {
+		return time.Time{}, fmt.Errorf("failed to read binlog sentinel for replay: %w", err)
+	}
+	// Binlogs uploaded before this sentinel version are committed.
+	if sentinel.Version >= batchUploadVersion {
+		return sentinelObject.GetLastModified(), nil
+	}
+	return utility.MaxTime, nil
 }
 
 func getBinlogSinceTS(ctx context.Context, folder storage.Folder, backupName string, streamSentinel *StreamSentinelDto) (time.Time, error) {
