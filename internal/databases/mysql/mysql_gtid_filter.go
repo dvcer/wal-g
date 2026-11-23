@@ -58,8 +58,6 @@ func (u *mysqlGtidFilter) shouldUpload(binlog, nextBinlog string) bool {
 	if u.gtidArchived == nil || u.gtidArchived.String() == "" {
 		tracelog.DebugLogger.Printf("Cannot extract set of uploaded binlogs from cache\n")
 		// continue uploading even when we cannot read uploadedGTIDs
-		u.gtidArchived = nextPreviousGTIDs
-		u.lastGtidSeen = nextPreviousGTIDs
 		return true
 	}
 
@@ -86,22 +84,9 @@ func (u *mysqlGtidFilter) shouldUpload(binlog, nextBinlog string) bool {
 		return false
 	}
 
-	err = u.gtidArchived.Update(currentBinlogGTIDSet.String())
-	if err != nil {
-		tracelog.WarningLogger.Printf("Cannot merge GTIDs: %v (gtid check)\n", err)
-		return true // math is broken. upload binlog
-	}
 	tracelog.InfoLogger.Printf("Should upload binlog %s with GTID set: %s (gtid check)\n", binlog, currentBinlogGTIDSet.String())
 	u.lastGtidSeen = nextPreviousGTIDs
 	return true
-}
-
-// getArchivedGTIDString returns the string representation of the archived GTID set for MySQL.
-func (u *mysqlGtidFilter) getArchivedGTIDString() string {
-	if u.gtidArchived == nil {
-		return ""
-	}
-	return u.gtidArchived.String()
 }
 
 // gtidSetMinus subtracts sub from s in place (set difference s\sub).

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,12 +29,59 @@ const BinlogSentinelPath = "binlog_sentinel_" + utility.VersionStr + ".json"
 const BinlogReadHeaderSize = 128 * 1024
 
 type BinlogSentinelDto struct {
-	GTIDArchived string `json:"GtidArchived"`
+	GTIDArchived string              `json:"GtidArchived"`
+	Intent       *BinlogUploadIntent `json:"Intent,omitempty"`
+}
+
+type BinlogUploadIntent struct {
+	Files []BinlogUploadFile `json:"Files"`
+}
+
+type BinlogUploadFile struct {
+	Name       string `json:"Name"`
+	ObjectName string `json:"ObjectName"`
+}
+
+type BatchMetadata struct {
+	PreviousGTIDs []mysql.GTIDSet
 }
 
 func (dto *BinlogSentinelDto) String() string {
 	result, _ := json.Marshal(dto)
 	return string(result)
+}
+
+// ApplyBatchMetadata updates the archived GTID checkpoint from the batch's ordered headers.
+func (sentinel *BinlogSentinelDto) ApplyBatchMetadata(metadata *BatchMetadata, flavor string) error {
+	archivedGTIDs, err := mysql.ParseGTIDSet(flavor, sentinel.GTIDArchived)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < len(metadata.PreviousGTIDs)-1; i++ {
+		archivedGTIDs, err = updateBinlogGTIDs(archivedGTIDs, metadata.PreviousGTIDs[i], metadata.PreviousGTIDs[i+1], flavor)
+		if err != nil {
+			return err
+		}
+	}
+	sentinel.GTIDArchived = archivedGTIDs.String()
+	return nil
+}
+
+func updateBinlogGTIDs(archived, currentBinlogGtid, nextBinlogGtid mysql.GTIDSet, flavor string) (mysql.GTIDSet, error) {
+	if flavor == mysql.MySQLFlavor {
+		// Only the uploaded file's transactions are known to be archived, including on the first batch.
+		contribution := nextBinlogGtid.Clone().(*mysql.MysqlGTIDSet)
+		gtidSetMinus(contribution, currentBinlogGtid.(*mysql.MysqlGTIDSet))
+		if err := archived.Update(contribution.String()); err != nil {
+			return nil, err
+		}
+	} else if !archived.Contain(nextBinlogGtid) {
+		// Preserve MariaDB's existing containment/Update checkpoint policy.
+		if err := archived.Update(nextBinlogGtid.String()); err != nil {
+			return nil, err
+		}
+	}
+	return archived, nil
 }
 
 func FetchBinlogSentinel(ctx context.Context, folder storage.Folder, sentinelDto interface{}) error {
@@ -64,18 +112,25 @@ func UploadBinlogSentinel(ctx context.Context, folder storage.Folder, sentinelDt
 }
 
 func GetBinlogPreviousGTIDs(filename string, flavor string) (mysql.GTIDSet, error) {
-	var result mysql.GTIDSet
 	fh, err := os.Open(filename)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open binlog file '%s'", filename)
 	}
 	defer utility.LoggedClose(fh, "failed to close binlog")
 
-	err = parseBinlogPreviousGTIDs(fh, flavor, &result)
-	if err != nil && result == nil {
-		return nil, errors.Wrapf(err, "could not find GTIDs in binlog file '%s' \n", filename)
-	}
+	return readBinlogFilePreviousGTIDs(fh, flavor)
+}
 
+func readBinlogFilePreviousGTIDs(file *os.File, flavor string) (mysql.GTIDSet, error) {
+	var result mysql.GTIDSet
+	// Read the header from the start, independently of the file offset after upload.
+	err := parseBinlogPreviousGTIDs(io.NewSectionReader(file, 0, math.MaxInt64), flavor, &result)
+	if result == nil {
+		if err == nil {
+			err = fmt.Errorf("previous GTID event not found")
+		}
+		return nil, fmt.Errorf("failed to read GTIDs from binlog %s: %w", file.Name(), err)
+	}
 	return result, nil
 }
 
