@@ -130,6 +130,7 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 	}
 
 	hadUploadsInThisRun := false
+	sentinelUpdated := false
 	for i := 0; i < len(binlogs); i++ {
 		binlog := binlogs[i]
 
@@ -180,11 +181,18 @@ func HandleBinlogPush(ctx context.Context, uploader internal.Uploader, untilBinl
 			tracelog.InfoLogger.Printf("Uploading binlog sentinel: %s", binlogSentinelDto)
 			err := UploadBinlogSentinel(ctx, rootFolder, &binlogSentinelDto)
 			tracelog.ErrorLogger.FatalOnError(err)
+			sentinelUpdated = true
 		}
 	}
 
 	// Write Binlog Cache (even when no data uploaded, it will create file on first run)
 	putCache(cache)
+	// One root-level version listing per successful invocation.
+	if sentinelUpdated {
+		if err := internal.PruneOldObjectVersions(ctx, rootFolder, BinlogSentinelPath); err != nil {
+			tracelog.WarningLogger.Printf("Failed to prune old binlog sentinel versions: %v", err)
+		}
+	}
 }
 
 func getMySQLBinlogs(conn *client.Conn) ([]string, error) {

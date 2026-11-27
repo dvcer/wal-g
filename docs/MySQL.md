@@ -187,6 +187,9 @@ Binlog and backup objects keep their configured retention. Bucket-level default
 Object Lock retention still applies to the sentinel if configured; this exception
 does not change bucket policies or existing object versions.
 
+When versioning is enabled, `binlog-push` tries to keep only the latest version
+of the binlog sentinel file (`binlog_sentinel_005.json`).
+
 ```bash
 wal-g binlog-push
 ```

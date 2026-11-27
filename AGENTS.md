@@ -79,6 +79,12 @@ Removing a sentinel also does not protect a restore that has already read it.
   client. Check `pkg/storages/s3/session.go` and its tests.
 - Recursive filesystem listings can contain leading slashes. Normalize paths
   before applying protected-prefix filters, and test both forms through wrappers.
+- Version pruning selects exact-name entries with explicit version IDs and
+  without a `LATEST` tag, preserving latest delete markers. Callers must serialize
+  cleanup for the same object; listing metadata is not revalidated before deletion.
+  Any future removal of a current marker must follow successful data cleanup to
+  avoid exposing old data. See
+  `internal/object_versions_test.go`.
 
 ## Avoid listings in hot paths
 
